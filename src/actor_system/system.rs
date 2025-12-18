@@ -1,0 +1,159 @@
+//! Actor system implementation.
+
+#![allow(dead_code)]
+
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+
+use tokio::sync::RwLock;
+
+use crate::actor_system::{
+    ActorError, ActorPath,
+    actor::{Actor, ActorRef, runner::ActorRunner},
+    bus::{EventBus, EventReceiver},
+};
+
+/// Events that this actor system will send.
+pub trait SystemEvent: Clone + Send + Sync + 'static {}
+
+/// An actor system that manages actors and provides event bus functionality.
+#[derive(Clone)]
+pub struct ActorSystem<E: SystemEvent> {
+    name: String,
+    actors: Arc<RwLock<HashMap<ActorPath, Box<dyn Any + Send + Sync + 'static>>>>,
+    bus: EventBus<E>,
+}
+
+impl<E: SystemEvent> ActorSystem<E> {
+    /// The name given to this actor system.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Publish an event on the actor system's event bus.
+    pub fn publish(&self, event: E) {
+        self.bus.send(event).unwrap_or_else(|error| {
+            log::warn!(
+                "No listeners active on event bus. Dropping event: {:?}",
+                &error.to_string(),
+            );
+            0
+        });
+    }
+
+    /// Subscribe to events of this actor system.
+    pub fn events(&self) -> EventReceiver<E> {
+        self.bus.subscribe()
+    }
+
+    /// Retrieves an actor running in this actor system.
+    pub async fn get_actor<A: Actor<E>>(&self, path: &ActorPath) -> Option<ActorRef<E, A>> {
+        let actors = self.actors.read().await;
+        actors
+            .get(path)
+            .and_then(|any| any.downcast_ref::<ActorRef<E, A>>().cloned())
+    }
+
+    pub(crate) async fn create_actor_path<A: Actor<E>>(
+        &self,
+        path: ActorPath,
+        actor: A,
+    ) -> Result<ActorRef<E, A>, ActorError> {
+        log::debug!("Creating actor '{}' on system '{}'...", &path, &self.name);
+
+        let mut actors = self.actors.write().await;
+        if actors.contains_key(&path) {
+            return Err(ActorError::Exists(path));
+        }
+
+        let system = self.clone();
+        let (mut runner, actor_ref) = ActorRunner::create(path, actor);
+        tokio::spawn(async move {
+            runner.start(system).await;
+        });
+
+        let path = actor_ref.path().clone();
+        let any = Box::new(actor_ref.clone());
+
+        actors.insert(path, any);
+
+        Ok(actor_ref)
+    }
+
+    /// Launches a new top level actor on this actor system.
+    pub async fn create_actor<A: Actor<E>>(
+        &self,
+        name: &str,
+        actor: A,
+    ) -> Result<ActorRef<E, A>, ActorError> {
+        let path = ActorPath::from("/user") / name;
+        self.create_actor_path(path, actor).await
+    }
+
+    /// Retrieve or create a new actor on this actor system if it does not exist yet.
+    pub async fn get_or_create_actor<A, F>(
+        &self,
+        name: &str,
+        actor_fn: F,
+    ) -> Result<ActorRef<E, A>, ActorError>
+    where
+        A: Actor<E>,
+        F: FnOnce() -> A,
+    {
+        let path = ActorPath::from("/user") / name;
+        self.get_or_create_actor_path(&path, actor_fn).await
+    }
+
+    pub(crate) async fn get_or_create_actor_path<A, F>(
+        &self,
+        path: &ActorPath,
+        actor_fn: F,
+    ) -> Result<ActorRef<E, A>, ActorError>
+    where
+        A: Actor<E>,
+        F: FnOnce() -> A,
+    {
+        let actors = self.actors.read().await;
+        match self.get_actor(path).await {
+            Some(actor) => Ok(actor),
+            None => {
+                drop(actors);
+                self.create_actor_path(path.clone(), actor_fn()).await
+            }
+        }
+    }
+
+    /// Stops the actor on this actor system. All its children will also be stopped.
+    pub async fn stop_actor(&self, path: &ActorPath) {
+        log::debug!("Stopping actor '{}' on system '{}'...", &path, &self.name);
+        let mut paths: Vec<ActorPath> = vec![path.clone()];
+        {
+            let running_actors = self.actors.read().await;
+            for running in running_actors.keys() {
+                if running.is_descendant_of(path) {
+                    paths.push(running.clone());
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths.reverse();
+        let mut actors = self.actors.write().await;
+        for path in &paths {
+            actors.remove(path);
+        }
+    }
+
+    /// Creates a new actor system on which you can create actors.
+    pub fn new(name: &str, bus: EventBus<E>) -> Self {
+        let name = name.to_string();
+        let actors = Arc::new(RwLock::new(HashMap::new()));
+        ActorSystem { name, actors, bus }
+    }
+}
+
+impl<E: SystemEvent> fmt::Debug for ActorSystem<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActorSystem")
+            .field("name", &self.name)
+            .finish()
+    }
+}
